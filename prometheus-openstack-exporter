@@ -31,6 +31,7 @@ import urlparse
 from threading import Thread
 import pickle
 import requests
+import dateutil.parser as dp
 from time import sleep, time
 from neutronclient.v2_0 import client as neutron_client
 # from novaclient.v1_1 import client as nova_client
@@ -44,9 +45,11 @@ from prometheus_client import CollectorRegistry, generate_latest, Gauge, CONTENT
 from netaddr import IPRange
 
 import logging
+import logging.config
 import logging.handlers
 
-log = logging.getLogger('poe-logger')
+logging.captureWarnings(True)
+log = logging.getLogger(__name__)
 
 
 def get_creds_dict(*names):
@@ -62,7 +65,7 @@ def get_creds_list(*names):
 
 def maybe_get_cacert():
     """Get cacert, None if unset"""
-    return env.get("OS_CACERT")
+    return config.get('check_certs',True) and env.get("OS_CACERT")
 
 
 def get_clients():
@@ -140,6 +143,7 @@ class DataGatherer(Thread):
         log.debug("Starting data gather thread")
         prodstack = {}
         while True:
+            log.debug('gathering run starts')
             start_time = time()
             try:
                 keystone, nova, neutron, cinder = get_clients()
@@ -161,11 +165,14 @@ class DataGatherer(Thread):
                 prodstack['floatingips'] = neutron.list_floatingips()['floatingips']
 
                 # Instance info is very heavy, disable until we merge this bit with pantomath
+                bs = config.get('poll_batch_size',100)
+                log.debug("polling instances, {} each batch".format(bs))
                 prodstack['instances'] = []
                 marker = ''
                 while True:
-                    search_opts = {'all_tenants': '1', 'limit': '100', 'marker': marker}
+                    search_opts = {'all_tenants': '1', 'limit': bs, 'marker': marker}
                     new_instances = [x._info for x in nova.servers.list(search_opts=search_opts)]
+                    log.debug("{} instances".format(len(prodstack['instances'])))
                     if new_instances:
                         marker = new_instances[-1]['id']
                         prodstack['instances'].extend(new_instances)
@@ -176,6 +183,7 @@ class DataGatherer(Thread):
                 prodstack['nova_quotas'] = {}
                 for t in prodstack['tenants']:
                     tid = t['id']
+                    log.debug('fetching quotas for tenant {}'.format(tid))
                     if self.use_nova_volumes:
                         prodstack['volume_quotas'][tid] = cinder.quotas.get(tid, usage=True)._info
                     # old OS versions (e.g. Mitaka) will 404 if we request details
@@ -195,6 +203,7 @@ class DataGatherer(Thread):
                 rename(self.cache_file + '.new', self.cache_file)
                 log.debug("Done dumping stats to {}".format(self.cache_file))
             self.duration = time() - start_time
+            log.debug('gathering run finished, sleeping now')
             sleep(self.refresh_interval)
 
     def get_stats(self):
@@ -267,7 +276,7 @@ class Neutron():
         return ips
 
     def gen_subnet_size(self):
-        labels = ['cloud', 'network_name']
+        labels = ['cloud', 'network_name', 'network_id']
         net_size = Gauge('neutron_net_size',
                          'Neutron networks size',
                          labels, registry=self.registry)
@@ -280,7 +289,7 @@ class Neutron():
                         # drown the IPv4 numbers we might care about.
                         continue
                     size += IPRange(pool['start'], pool['end']).size
-            l = [config['cloud'], self.network_map[n['id']]]
+            l = [config['cloud'], self.network_map[n['id']], n['id']]
             net_size.labels(*l).set(size)
 
     def get_stats(self):
@@ -336,7 +345,7 @@ class Nova():
             self.prodstack = pickle.load(f)[0]
         self.hypervisors = self.prodstack['hypervisors']
         self.tenant_map = {t['id']: t['name'] for t in self.prodstack['tenants']}
-        self.flavor_map = {f['id']: {'ram': f['ram'], 'disk': f['disk'], 'vcpus': f['vcpus']}
+        self.flavor_map = {f['id']: {fk:f[fk] for fk in f.keys() }
                            for f in self.prodstack['flavors']}
         self.aggregate_map = {}
         self.services_map = {}
@@ -351,18 +360,26 @@ class Nova():
         free_ram_mbs = host['memory_mb'] * config['openstack_allocation_ratio_ram'] - host['memory_mb_used']
         free_disk_gbs = host['local_gb'] * config['openstack_allocation_ratio_disk'] - host['local_gb_used']
         s = config['schedulable_instance_size']
-        return min(int(free_vcpus / s['vcpu']),
-                   int(free_ram_mbs / s['ram_mbs']),
-                   int(free_disk_gbs / s['disk_gbs']))
+        if s['disk_gbs'] > 0:
+            return min(int(free_vcpus / s['vcpu']),
+                    int(free_ram_mbs / s['ram_mbs']),
+                    int(free_disk_gbs / s['disk_gbs']))
+        else:
+            return min(int(free_vcpus / s['vcpu']),
+                    int(free_ram_mbs / s['ram_mbs']))
 
     def _get_schedulable_instances_capacity(self, host):
         capacity_vcpus = host['vcpus'] * config['openstack_allocation_ratio_vcpu']
         capacity_ram_mbs = host['memory_mb'] * config['openstack_allocation_ratio_ram']
         capacity_disk_gbs = host['local_gb'] * config['openstack_allocation_ratio_disk']
         s = config['schedulable_instance_size']
-        return min(int(capacity_vcpus / s['vcpu']),
-                   int(capacity_ram_mbs / s['ram_mbs']),
-                   int(capacity_disk_gbs / s['disk_gbs']))
+        if s['disk_gbs'] > 0:
+            return min(int(capacity_vcpus / s['vcpu']),
+                    int(capacity_ram_mbs / s['ram_mbs']),
+                    int(capacity_disk_gbs / s['disk_gbs']))
+        else:
+            return min(int(capacity_vcpus / s['vcpu']),
+                    int(capacity_ram_mbs / s['ram_mbs']))
 
     def gen_hypervisor_stats(self):
         labels = ['cloud', 'hypervisor_hostname', 'aggregate', 'nova_service_status', 'arch']
@@ -416,6 +433,24 @@ class Nova():
         instances = Gauge('nova_instances',
                           'Nova instances metrics',
                           ['cloud', 'tenant', 'instance_state'], registry=self.registry)
+        instance_info=Gauge('nova_instance_info',
+                            'Information about specific instances',
+                            ['cloud','id', 'name', 'tenant_id',
+                            'user_id', 'vm_state', 'power_state',
+                            'hypervisor_hostname', 'flavor', 'az']
+                            , registry=self.registry)
+        instance_info_launch=Gauge('nova_instance_launch_ms',
+                            'Information about specific instances',
+                            ['cloud','id', 'name', 'tenant_id',
+                            'user_id', 'vm_state', 'power_state',
+                            'hypervisor_hostname', 'flavor', 'az']
+                            , registry=self.registry)
+        instance_info_create=Gauge('nova_instance_created_ms',
+                            'Information about specific instances',
+                            ['cloud','id', 'name', 'tenant_id',
+                            'user_id', 'vm_state', 'power_state',
+                            'hypervisor_hostname', 'flavor', 'az']
+                            , registry=self.registry)
         res_ram = Gauge('nova_resources_ram_mbs',
                         'Nova RAM usage metric',
                         ['cloud', 'tenant'], registry=self.registry)
@@ -429,16 +464,69 @@ class Nova():
             if i['tenant_id'] in self.tenant_map:
                 tenant = self.tenant_map[i['tenant_id']]
             else:
-                tenant = 'orphaned'
+                tenant = '__orphaned__'
             instances.labels(config['cloud'], tenant, i['status']).inc()
 
-            if i['flavor']['id'] in self.flavor_map:
-                flavor = self.flavor_map[i['flavor']['id']]
+            f_id=i['flavor']['id']
+            flavorname=f_id
+            if f_id in self.flavor_map:
+                flavor = self.flavor_map[f_id]
                 res_ram.labels(config['cloud'], tenant).inc(flavor['ram'])
                 res_vcpus.labels(config['cloud'], tenant).inc(flavor['vcpus'])
                 res_disk.labels(config['cloud'], tenant).inc(flavor['disk'])
+                flavorname=flavor['name']
             else:
                 missing_flavors = True
+
+            instance_info.labels(
+                        config['cloud'],
+                        i['id'],
+                        i['name'],
+                        i['tenant_id'],
+                        i['user_id'],
+                        i['OS-EXT-STS:vm_state'],
+                        i['OS-EXT-STS:power_state'],
+                        i['OS-EXT-SRV-ATTR:host'],
+                        flavorname,
+                        i['OS-EXT-AZ:availability_zone']
+                    ).set(1)
+
+            try:
+                instance_info_launch.labels(
+                            config['cloud'],
+                            i['id'], i['name'],
+                            i['tenant_id'],
+                            i['user_id'],
+                            i['OS-EXT-STS:vm_state'],
+                            i['OS-EXT-STS:power_state'],
+                            i['OS-EXT-SRV-ATTR:host'],
+                            flavorname,
+                            i['OS-EXT-AZ:availability_zone']
+                        ).set(
+                            dp.parse(i['OS-SRV-USG:launched_at']).
+                                strftime('%s000')
+                            )
+            except TypeError as te:
+                log.debug(te.message)
+
+            try:
+                    instance_info_create.labels(
+                                config['cloud'],
+                                i['id'],
+                                i['name'],
+                                i['tenant_id'],
+                                i['user_id'],
+                                i['OS-EXT-STS:vm_state'],
+                                i['OS-EXT-STS:power_state'],
+                                i['OS-EXT-SRV-ATTR:host'],
+                                flavorname,
+                                i['OS-EXT-AZ:availability_zone']
+                            ).set(
+                                dp.parse(i['created']).
+                                    strftime('%s000')
+                            )
+            except TypeError as te:
+                log.debug(te.message)
 
         # If flavors were deleted we can't reliably find out resouerce use
         if missing_flavors:
@@ -451,6 +539,15 @@ class Nova():
                               [], registry=self.registry)
             res_disk = Gauge('nova_resources_disk_gbs', 'Nova disk usage metric unavailable, missing flavors',
                              [], registry=self.registry)
+
+    def gen_tenant_stats(self):
+        tenants_info = Gauge(
+                'openstack_tenant_info',
+                'OpenStack information on tenants',
+                ['domain_id', 'tenant_id', 'tenant_name', 'tenant_description'],
+                 registry=self.registry)
+        for t in self.prodstack['tenants']:
+            tenants_info.labels(t['domain_id'],t['id'],t['name'],t['description']).set(1)
 
     def gen_overcommit_stats(self):
         labels = ['cloud', 'resource']
@@ -497,6 +594,7 @@ class Nova():
 
     def get_stats(self):
         log.debug("get_stats")
+        self.gen_tenant_stats()
         self.gen_hypervisor_stats()
         self.gen_instance_stats()
         self.gen_overcommit_stats()
@@ -544,6 +642,7 @@ class Swift():
             try:
                 r = requests.get(self.baseurl.format(h, 'quarantined'))
             except requests.exceptions.RequestException:
+                log.debug(traceback.format_exc())
                 continue
             for ring in ['accounts', 'objects', 'containers']:
                 swift_quarantine.labels(config['cloud'], h, ring).set(r.json().get(ring))
@@ -562,27 +661,29 @@ class Swift():
             try:
                 r = requests.get(self.baseurl.format(h, 'replication/object'))
             except requests.exceptions.RequestException:
+                log.debug(traceback.format_exc())
                 continue
             try:
                 swift_repl_duration.labels(config['cloud'], h, 'object').set(r.json()['object_replication_time'])
             except TypeError:
-                print(traceback.format_exc())
+                log.error(traceback.format_exc())
 
             for ring in ['account', 'container']:
                 try:
                     r = requests.get(self.baseurl.format(h, 'replication/' + ring))
                 except requests.exceptions.RequestException:
+                    log.debug(traceback.format_exc())
                     continue
                 try:
                     swift_repl_duration.labels(config['cloud'], h, ring).set(r.json()['replication_time'])
                 except TypeError:
-                    print(traceback.format_exc())
+                    log.error(traceback.format_exc())
 
                 for metric in metrics:
                     try:
                         swift_repl.labels(config['cloud'], h, ring, metric).set(r.json()['replication_stats'][metric])
                     except TypeError:
-                        print(traceback.format_exc())
+                        log.error(traceback.format_exc())
 
     def get_stats(self):
         self.gen_up_stats()
@@ -647,17 +748,39 @@ if __name__ == '__main__':
                                      formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument('config_file', nargs='?',
                         help='Configuration file path',
-                        default='/etc/prometheus/prometheus-openstack-exporter.yaml',
+                        default='./prometheus-openstack-exporter.yaml',
                         type=argparse.FileType('r'))
     args = parser.parse_args()
     log.setLevel(logging.DEBUG)
+
+    config = yaml.safe_load(args.config_file.read())
+
+    try:
+        logging.config.dictConfig(config['logging'])
+    except KeyError:
+        sh=logging.StreamHandler()
+        try:
+            sh.setFormatter(
+                        logging.Formatter(config['logging']['formatters']['simple']['format'])
+                    )
+        except (AttributeError,KeyError):
+            log.debug(traceback.format_exc())
+
+        log.addHandler(sh)
+
     for logsock in ('/dev/log', '/var/run/syslog'):
         if path.exists(logsock):
-            log.addHandler(logging.handlers.SysLogHandler(address=logsock))
-    else:
-        log.addHandler(logging.StreamHandler())
-    config = yaml.safe_load(args.config_file.read())
+            sh = logging.handlers.SysLogHandler(address=logsock)
+            try:
+                sh.setFormatter(
+                            logging.Formatter(config['logging']['formatters']['simple']['format'])
+                        )
+            except (AttributeError,KeyError):
+                log.debug(traceback.format_exc())
+
+            log.addHandler(sh)
+
     data_gatherer = DataGatherer()
     data_gatherer.start()
-    server = ForkingHTTPServer(('', config.get('listen_port')), handler)
+    server = ForkingHTTPServer((config.get('listen_ip',''), config.get('listen_port')), handler)
     server.serve_forever()
